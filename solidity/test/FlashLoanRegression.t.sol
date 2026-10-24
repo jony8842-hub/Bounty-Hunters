@@ -18,6 +18,13 @@ contract MockERC20 is IERC20 {
         emit Transfer(address(0), to, amount);
     }
 
+    function rebase(address account, uint256 newBalance) external {
+        uint256 oldBalance = balanceOf[account];
+        if (newBalance > oldBalance) totalSupply += newBalance - oldBalance;
+        else totalSupply -= oldBalance - newBalance;
+        balanceOf[account] = newBalance;
+    }
+
     function approve(address spender, uint256 amount) external override returns (bool) {
         allowance[msg.sender][spender] = amount;
         emit Approval(msg.sender, spender, amount);
@@ -63,6 +70,26 @@ contract FlashLoanReceiver is IFlashLoanReceiver {
     }
 }
 
+contract RebasingFlashLoanReceiver is IFlashLoanReceiver {
+    FlashLoan public immutable loan;
+    MockERC20 public immutable token;
+
+    constructor(FlashLoan _loan, MockERC20 _token) {
+        loan = _loan;
+        token = _token;
+    }
+
+    function execute(uint256 amount) external {
+        loan.flashLoan(amount, "");
+    }
+
+    function onFlashLoan(address, uint256 amount, uint256 fee, bytes calldata) external override {
+        require(msg.sender == address(loan), "unexpected caller");
+        token.rebase(address(loan), token.balanceOf(address(loan)) + 1);
+        require(token.transfer(address(loan), amount + fee), "repay failed");
+    }
+}
+
 contract FlashLoanRegressionTest {
     MockERC20 private token;
     FlashLoan private loan;
@@ -88,11 +115,7 @@ contract FlashLoanRegressionTest {
     function testLoanCannotExceedHalfOfAccountedPool() public {
         setUp();
         bool reverted;
-        try receiver.execute(501) {
-            reverted = false;
-        } catch {
-            reverted = true;
-        }
+        try receiver.execute(501) { reverted = false; } catch { reverted = true; }
         require(reverted, "pool cap bypassed");
     }
 
@@ -100,11 +123,7 @@ contract FlashLoanRegressionTest {
         setUp();
         loan.pause();
         bool reverted;
-        try receiver.execute(100) {
-            reverted = false;
-        } catch {
-            reverted = true;
-        }
+        try receiver.execute(100) { reverted = false; } catch { reverted = true; }
         require(reverted, "paused loan succeeded");
         loan.unpause();
         receiver.execute(100);
@@ -115,12 +134,18 @@ contract FlashLoanRegressionTest {
         setUp();
         token.mint(address(loan), 1_000);
         bool reverted;
-        try receiver.execute(501) {
-            reverted = false;
-        } catch {
-            reverted = true;
-        }
+        try receiver.execute(501) { reverted = false; } catch { reverted = true; }
         require(reverted, "raw balance bypassed accounting");
+    }
+
+    function testRebasingBalanceChangeDuringCallbackIsRejected() public {
+        setUp();
+        RebasingFlashLoanReceiver rebasingReceiver = new RebasingFlashLoanReceiver(loan, token);
+        token.mint(address(rebasingReceiver), 200);
+        bool reverted;
+        try rebasingReceiver.execute(100) { reverted = false; } catch { reverted = true; }
+        require(reverted, "rebasing callback bypassed exact accounting");
+        require(loan.accountedPoolBalance() == 1_000, "accounting changed after rejected loan");
     }
 
     function testOwnerCanWithdrawOnlyAccruedFees() public {
