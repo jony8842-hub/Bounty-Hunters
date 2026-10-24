@@ -40,8 +40,11 @@ contract FlashLoan {
         require(amount > 0, "Amount must be > 0");
 
         uint256 accountedBefore = accountedPoolBalance;
+        uint256 balanceBefore = loanToken.balanceOf(address(this));
+        // Reject rebases and unsolicited transfers at the loan boundary.
+        require(balanceBefore == accountedBefore, "Pool balance drift");
         require(amount <= accountedBefore / 2, "Exceeds max loan amount");
-        require(loanToken.balanceOf(address(this)) >= amount, "Insufficient pool balance");
+        require(balanceBefore >= amount, "Insufficient pool balance");
 
         // Divide before multiplying so the fee calculation cannot overflow.
         uint256 fee = (amount / 10_000) * feeBPS;
@@ -51,10 +54,9 @@ contract FlashLoan {
         require(loanToken.transfer(msg.sender, amount), "Loan transfer failed");
         IFlashLoanReceiver(msg.sender).onFlashLoan(address(loanToken), amount, fee, data);
 
-        // Internal accounting is the source of truth; rebasing balance changes cannot
-        // create a false repayment or silently increase the amount available to borrow.
-        uint256 expectedBalance = accountedBefore + fee;
-        require(loanToken.balanceOf(address(this)) >= expectedBalance, "Loan not repaid");
+        // Exact repayment prevents a rebasing token from manufacturing balance.
+        uint256 expectedBalance = balanceBefore + fee;
+        require(loanToken.balanceOf(address(this)) == expectedBalance, "Loan not repaid");
         accountedPoolBalance = expectedBalance;
         totalFees += fee;
         emit FlashLoanExecuted(msg.sender, amount, fee);
@@ -62,16 +64,23 @@ contract FlashLoan {
 
     function depositToPool(uint256 amount) external {
         require(amount > 0, "Amount must be > 0");
+        uint256 balanceBefore = loanToken.balanceOf(address(this));
+        require(balanceBefore == accountedPoolBalance, "Pool balance drift");
         require(loanToken.transferFrom(msg.sender, address(this), amount), "Deposit failed");
-        accountedPoolBalance += amount;
+        uint256 balanceAfter = loanToken.balanceOf(address(this));
+        require(balanceAfter == balanceBefore + amount, "Pool balance drift");
+        accountedPoolBalance = balanceAfter;
     }
 
     function withdrawFees() external onlyOwner {
         uint256 fees = totalFees;
         require(fees > 0, "No fees");
-        totalFees = 0;
-        accountedPoolBalance -= fees;
+        uint256 balanceBefore = loanToken.balanceOf(address(this));
+        require(balanceBefore == accountedPoolBalance, "Pool balance drift");
         require(loanToken.transfer(owner, fees), "Fee transfer failed");
+        require(loanToken.balanceOf(address(this)) == balanceBefore - fees, "Pool balance drift");
+        totalFees = 0;
+        accountedPoolBalance = balanceBefore - fees;
     }
 
     function pause() external onlyOwner {
